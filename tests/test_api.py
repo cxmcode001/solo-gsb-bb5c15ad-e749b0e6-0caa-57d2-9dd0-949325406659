@@ -928,3 +928,125 @@ def test_audit_omission_gate_failure_returns_422_with_failed_segment():
 def test_audit_omission_index_lists_endpoint():
     info = client.get("/").json()
     assert info["audit_omission"] == "POST /api/audit-omission"
+
+
+COMPARE_LEFT = ["学而?习之", "时习之不", "之不亦乐乎"]
+COMPARE_RIGHT = ["学而?习之", "时习之不", "之不亦说乎"]
+
+
+def test_compare_editions_endpoint_substitution_block():
+    resp = client.post(
+        "/api/compare-editions",
+        json={"left_segments": COMPARE_LEFT, "right_segments": COMPARE_RIGHT},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["left_text"] == "学而时习之不亦乐乎"
+    assert data["right_text"] == "学而时习之不亦说乎"
+    assert data["total_cost"] == 1
+    assert data["ambiguous"] is False
+    assert len(data["blocks"]) == 1
+    block = data["blocks"][0]
+    assert block["cost"] == 1
+    assert (block["left"]["start"], block["left"]["end"]) == (7, 8)
+    assert (block["right"]["start"], block["right"]["end"]) == (7, 8)
+    assert block["left"]["fragment"] == "乐"
+    assert block["right"]["fragment"] == "说"
+    # sources 与 /api/assemble 对应区间一致
+    left_sources = client.post(
+        "/api/assemble", json={"segments": COMPARE_LEFT}
+    ).json()["sources"]
+    right_sources = client.post(
+        "/api/assemble", json={"segments": COMPARE_RIGHT}
+    ).json()["sources"]
+    assert block["left"]["sources"] == left_sources[7:8]
+    assert block["right"]["sources"] == right_sources[7:8]
+
+
+def test_compare_editions_identical_returns_empty_blocks():
+    resp = client.post(
+        "/api/compare-editions",
+        json={"left_segments": COMPARE_LEFT, "right_segments": COMPARE_LEFT},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["left_text"] == data["right_text"] == "学而时习之不亦乐乎"
+    assert data["total_cost"] == 0
+    assert data["ambiguous"] is False
+    assert data["blocks"] == []
+
+
+def test_compare_editions_insertion_block_empty_side():
+    resp = client.post(
+        "/api/compare-editions",
+        json={
+            "left_segments": COMPARE_LEFT,
+            "right_segments": ["学而?习之", "时习之不", "之不亦X乐乎"],
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total_cost"] == 1
+    block = data["blocks"][0]
+    assert (block["left"]["start"], block["left"]["end"]) == (7, 7)
+    assert block["left"]["fragment"] == ""
+    assert block["left"]["sources"] == []
+    assert (block["right"]["start"], block["right"]["end"]) == (7, 8)
+    assert block["right"]["fragment"] == "X"
+
+
+def test_compare_editions_gate_failure_reports_side():
+    bad = ["孔子曰未知", "未知生焉", "完全无关文本"]
+    resp = client.post(
+        "/api/compare-editions",
+        json={"left_segments": bad, "right_segments": COMPARE_LEFT},
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["side"] == "left"
+    assert detail["failed_segment"] == 2
+
+    resp = client.post(
+        "/api/compare-editions",
+        json={"left_segments": COMPARE_LEFT, "right_segments": bad},
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["side"] == "right"
+    assert detail["failed_segment"] == 2
+
+
+def test_compare_editions_reuses_assemble_segment_limits():
+    good = ["学而?习之", "时习之不"]
+    # 缺字段
+    assert client.post("/api/compare-editions", json={}).status_code == 422
+    assert client.post(
+        "/api/compare-editions", json={"left_segments": good}
+    ).status_code == 422
+    # 段数不足 / 超上限（两侧分别校验）
+    assert client.post(
+        "/api/compare-editions",
+        json={"left_segments": ["abc"], "right_segments": good},
+    ).status_code == 422
+    assert client.post(
+        "/api/compare-editions",
+        json={"left_segments": good, "right_segments": ["aa", "bb", "cc", "dd", "ee", "ff"]},
+    ).status_code == 422
+    # 单段过长 / 总长超限 / 空段
+    assert client.post(
+        "/api/compare-editions",
+        json={"left_segments": ["a" * 500, "b" * 501], "right_segments": good},
+    ).status_code == 422
+    assert client.post(
+        "/api/compare-editions",
+        json={"left_segments": ["字" * 400, "字" * 401], "right_segments": good},
+    ).status_code == 422
+    assert client.post(
+        "/api/compare-editions",
+        json={"left_segments": ["abc", ""], "right_segments": good},
+    ).status_code == 422
+
+
+def test_compare_editions_index_lists_endpoint():
+    info = client.get("/").json()
+    assert info["compare_editions"] == "POST /api/compare-editions"
