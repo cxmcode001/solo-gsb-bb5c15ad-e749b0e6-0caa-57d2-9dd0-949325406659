@@ -33,6 +33,13 @@
   （相同字或任一侧 ``?`` 记 0、已知异字记 1，整稿最多 2）的方案；唯一
   方案返回插入位置、缺文、异字数与接缝两侧 sources，不同缺文位置并列返回
   409，无合格方案返回 422。结果仅供人工复核，不改写拼接稿。
+- ``POST /api/compare-editions``：提交 left_segments、right_segments 两组
+  各 2～5 段转写，分别沿用 ``/api/assemble`` 的段数、长度限制与续接门槛
+  各自拼接，再对两份拼接稿做全局逐字最小编辑对齐（相同字或任一侧 ``?``
+  代价 0，替换/插入/删除各 1）；同分路径按对角、删除左字、插入右字固定
+  择优，标记是否存在多条最优路径，把连续非零代价列合并为差异块返回两侧
+  左闭右开区间、原文与逐字 sources、总代价及歧义标记；完全一致时差异块
+  为空。
 """
 
 from fastapi import FastAPI, HTTPException
@@ -41,6 +48,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from .aligner import WILDCARD, align
 from .assembler import AssemblyError, assemble
 from .collator import collate
+from .comparator import EditionAssemblyError, compare_editions
 from .locator import (
     MAX_QUOTE_LEN as LOCATE_MAX_QUOTE_LEN,
 )
@@ -502,6 +510,87 @@ class AuditOmissionResponse(OmissionScheme):
     reference: str = Field(..., description="原样回显的独立参照转写")
 
 
+class CompareEditionsRequest(BaseModel):
+    """双版本对勘请求：两组各 2～5 段转写，分别沿用 /api/assemble 的限制。"""
+
+    left_segments: list[str] = Field(
+        ...,
+        min_length=MIN_SEGMENTS,
+        max_length=MAX_SEGMENTS,
+        description="左版本按阅读顺序排列的转写文本（2～5 段），未辨认字以 ? 表示",
+        examples=[["学而?习之", "时习之不", "之不亦乐乎"]],
+    )
+    right_segments: list[str] = Field(
+        ...,
+        min_length=MIN_SEGMENTS,
+        max_length=MAX_SEGMENTS,
+        description="右版本按阅读顺序排列的转写文本（2～5 段），未辨认字以 ? 表示",
+        examples=[["学而?习之", "时习之不亦", "之不亦乐乎"]],
+    )
+
+    @model_validator(mode="after")
+    def _validate_segments(self):
+        for name, segs in (
+            ("left_segments", self.left_segments),
+            ("right_segments", self.right_segments),
+        ):
+            for idx, seg in enumerate(segs):
+                if len(seg) < 1:
+                    raise ValueError(f"{name} 第 {idx + 1} 段文本不能为空")
+                if len(seg) > MAX_TEXT_LEN:
+                    raise ValueError(
+                        f"{name} 第 {idx + 1} 段文本超过 {MAX_TEXT_LEN} 字"
+                    )
+            total = sum(len(seg) for seg in segs)
+            if total > MAX_TOTAL_LEN:
+                raise ValueError(
+                    f"{name} 各段文本总长 {total} 字，超过 {MAX_TOTAL_LEN} 字上限"
+                )
+        return self
+
+
+class EditionInterval(BaseModel):
+    """一个版本在差异块内的原文区间（下标从 0 开始，左闭右开）。"""
+
+    start: int = Field(..., description="区间起点下标（含，从 0 开始）")
+    end: int = Field(..., description="区间终点下标（不含，左闭右开）")
+    fragment: str = Field(..., description="区间原文片段（该侧在此块无字时为空串）")
+    sources: list[list[CharSource]] = Field(
+        ...,
+        description="该区间逐字来源列表，与 fragment 等长，规则与 /api/assemble 一致；"
+                    "该侧在此块无字时为空列表",
+    )
+
+
+class DifferenceBlock(BaseModel):
+    """连续非零代价列合并而成的差异块：两侧各给一个左闭右开区间。"""
+
+    left: EditionInterval = Field(..., description="左版本差异区间（删除部分）")
+    right: EditionInterval = Field(..., description="右版本差异区间（插入部分）")
+
+
+class CompareEditionsResponse(BaseModel):
+    """双版本对勘结果。"""
+
+    left_text: str = Field(..., description="左版本拼接文本（沿用 /api/assemble，不被改写）")
+    right_text: str = Field(..., description="右版本拼接文本（沿用 /api/assemble，不被改写）")
+    total_cost: int = Field(
+        ...,
+        description="两份拼接稿全局逐字最小编辑对齐的总代价"
+                    "（相同字或任一侧 ? 为 0，替换、插入、删除各 1）",
+    )
+    ambiguous: bool = Field(
+        ...,
+        description="取得该总代价的最优对齐路径是否存在多条"
+                    "（回溯对齐固定按对角→删除左字→插入右字择优）",
+    )
+    blocks: list[DifferenceBlock] = Field(
+        ...,
+        description="连续非零代价列合并的差异块，按阅读顺序排列；"
+                    "两份稿子完全一致（或仅差 ?）时为空列表",
+    )
+
+
 @app.get("/", summary="服务信息")
 def index():
     return {
@@ -515,6 +604,7 @@ def index():
         "locate_quotes": "POST /api/locate-quotes",
         "find_repetition": "POST /api/find-repetition",
         "audit_omission": "POST /api/audit-omission",
+        "compare_editions": "POST /api/compare-editions",
         "docs": "/docs",
         "health": "/health",
     }
@@ -1079,5 +1169,55 @@ def api_audit_omission(req: AuditOmissionRequest):
                 "message": str(exc),
                 "diff": exc.diff,
                 "ties": exc.ties,
+            },
+        ) from exc
+
+
+@app.post(
+    "/api/compare-editions",
+    response_model=CompareEditionsResponse,
+    status_code=200,
+    summary="两份拼接稿的全局逐字最小编辑对勘",
+    description=(
+        "请求含两组各 **2～5 段**转写 `left_segments`、`right_segments`，各自沿用 "
+        "`/api/assemble` 的段数/长度限制（单段最长 500 字、各侧各段总长最长 800 字）"
+        "与续接门槛（最高对齐得分 > 0 且至少 2 对相同已知字，否则返回 **422** 并指出"
+        " `side` 与 `failed_segment`），**分别拼接**为两份稿子。随后对两份拼接稿做"
+        "**全局逐字最小编辑对齐**（两端固定，不允许自由端）：相同字、或任一侧为 `?` "
+        "的字符对代价 **0**；**替换、删除左字、插入右字各代价 1**。同一格有多条同代价"
+        "入边时，回溯所用对齐按**对角 → 删除左字 → 插入右字**的固定次序择优（输出确定），"
+        "另以 `ambiguous` 标记取得最小总代价的最优路径是否存在**多条**。把对齐中**连续的"
+        "非零代价列**合并为差异块 `blocks`：每块给出两侧在各自拼接稿上的**左闭右开区间**"
+        " `[start, end)`、区间原文 `fragment` 与该区间**逐字 sources**（某侧在块内无字时"
+        "区间为空、sources 为空列表）；零代价列用于分块。两份稿子**完全一致**（或仅差 `?`）"
+        "时差异块为空、`total_cost` 为 0。接口只做对勘，**不改写任何一份拼接稿**。"
+    ),
+    responses={
+        422: {
+            "description": "某一侧续接失败或请求参数不合法",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": {
+                            "message": "left_segments 第 3 段（段序号 2）无法与前文可靠拼接：需要最高对齐得分 > 0 且至少 2 对相同已知字",
+                            "side": "left",
+                            "failed_segment": 2,
+                        }
+                    }
+                }
+            },
+        },
+    },
+)
+def api_compare_editions(req: CompareEditionsRequest):
+    try:
+        return compare_editions(req.left_segments, req.right_segments)
+    except EditionAssemblyError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": str(exc),
+                "side": exc.side,
+                "failed_segment": exc.failed_segment,
             },
         ) from exc

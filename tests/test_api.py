@@ -928,3 +928,181 @@ def test_audit_omission_gate_failure_returns_422_with_failed_segment():
 def test_audit_omission_index_lists_endpoint():
     info = client.get("/").json()
     assert info["audit_omission"] == "POST /api/audit-omission"
+
+
+def test_compare_editions_endpoint_identical():
+    body = ["学而?习之", "时习之不", "之不亦乐乎"]
+    resp = client.post(
+        "/api/compare-editions",
+        json={"left_segments": body, "right_segments": body},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["left_text"] == data["right_text"] == "学而时习之不亦乐乎"
+    assert data["total_cost"] == 0
+    assert data["ambiguous"] is False
+    assert data["blocks"] == []
+
+
+def test_compare_editions_endpoint_substitution_block():
+    resp = client.post(
+        "/api/compare-editions",
+        json={
+            "left_segments": ["甲乙丙丁戊己", "戊己庚辛"],
+            "right_segments": ["甲乙丙X戊己", "戊己庚辛"],
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total_cost"] == 1
+    assert data["ambiguous"] is False
+    assert len(data["blocks"]) == 1
+    block = data["blocks"][0]
+    assert block["left"] == {
+        "start": 3,
+        "end": 4,
+        "fragment": "丁",
+        "sources": [[{"segment": 0, "pos": 3}]],
+    }
+    assert block["right"]["start"] == 3 and block["right"]["end"] == 4
+    assert block["right"]["fragment"] == "X"
+    assert len(block["right"]["sources"]) == 1
+
+
+def test_compare_editions_endpoint_insertion_block():
+    resp = client.post(
+        "/api/compare-editions",
+        json={
+            "left_segments": ["甲乙丙戊己", "戊己庚辛"],
+            "right_segments": ["甲乙丙丁戊己", "戊己庚辛"],
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total_cost"] == 1 and data["ambiguous"] is False
+    block = data["blocks"][0]
+    assert block["left"] == {
+        "start": 3,
+        "end": 3,
+        "fragment": "",
+        "sources": [],
+    }
+    assert block["right"]["start"] == 3 and block["right"]["end"] == 4
+    assert block["right"]["fragment"] == "丁"
+
+
+def test_compare_editions_wildcard_is_zero_cost():
+    resp = client.post(
+        "/api/compare-editions",
+        json={
+            "left_segments": ["学而?习之", "时习之"],
+            "right_segments": ["学而时习之", "时习之"],
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total_cost"] == 0 and data["blocks"] == []
+    assert data["ambiguous"] is False
+
+
+def test_compare_editions_consecutive_nonzero_columns_merge():
+    resp = client.post(
+        "/api/compare-editions",
+        json={
+            "left_segments": ["甲XY丙丁", "丙丁"],
+            "right_segments": ["甲丙丁", "丙丁"],
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total_cost"] == 2 and data["ambiguous"] is False
+    assert len(data["blocks"]) == 1
+    block = data["blocks"][0]
+    assert block["left"]["fragment"] == "XY"
+    assert block["right"]["fragment"] == ""
+    assert (block["left"]["start"], block["left"]["end"]) == (1, 3)
+    assert (block["right"]["start"], block["right"]["end"]) == (1, 1)
+
+
+def test_compare_editions_ambiguous_flag():
+    # 拼接稿 甲乙 vs 乙甲：两条最优路径（替换/替换 与 删除+插入+删除的等价形态）
+    resp = client.post(
+        "/api/compare-editions",
+        json={
+            "left_segments": ["甲乙戊己", "戊己"],
+            "right_segments": ["乙甲戊己", "戊己"],
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total_cost"] == 2
+    assert data["ambiguous"] is True
+    # 固定择优（对角优先）：一个差异块，两侧各取一替换字
+    assert len(data["blocks"]) == 1
+    block = data["blocks"][0]
+    assert block["left"]["fragment"] == "甲乙"
+    assert block["right"]["fragment"] == "乙甲"
+
+
+def test_compare_editions_gate_failure_returns_422_with_side():
+    bad = ["孔子曰未知", "未知生焉", "完全无关文本"]
+    good = ["学而?习之", "时习之不", "之不亦乐乎"]
+    resp = client.post(
+        "/api/compare-editions",
+        json={"left_segments": bad, "right_segments": good},
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["side"] == "left"
+    assert detail["failed_segment"] == 2
+
+    resp = client.post(
+        "/api/compare-editions",
+        json={"left_segments": good, "right_segments": bad},
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["side"] == "right"
+    assert detail["failed_segment"] == 2
+
+
+def test_compare_editions_reuses_assemble_segment_limits():
+    body = ["学而?习之", "时习之"]
+    # left_segments 段数不足 / 超上限
+    assert client.post(
+        "/api/compare-editions",
+        json={"left_segments": ["abc"], "right_segments": body},
+    ).status_code == 422
+    assert client.post(
+        "/api/compare-editions",
+        json={"left_segments": ["aa", "bb", "cc", "dd", "ee", "ff"],
+              "right_segments": body},
+    ).status_code == 422
+    # right_segments 段数不足
+    assert client.post(
+        "/api/compare-editions",
+        json={"left_segments": body, "right_segments": ["abc"]},
+    ).status_code == 422
+    # 单段过长 / 总长超限 / 空段（任一侧）
+    assert client.post(
+        "/api/compare-editions",
+        json={"left_segments": ["a" * 500, "b" * 501], "right_segments": body},
+    ).status_code == 422
+    assert client.post(
+        "/api/compare-editions",
+        json={"left_segments": body, "right_segments": ["字" * 400, "字" * 401]},
+    ).status_code == 422
+    assert client.post(
+        "/api/compare-editions",
+        json={"left_segments": body, "right_segments": ["abc", ""]},
+    ).status_code == 422
+    # 缺字段
+    assert client.post(
+        "/api/compare-editions", json={"left_segments": body}
+    ).status_code == 422
+    assert client.post("/api/compare-editions", json={}).status_code == 422
+
+
+def test_compare_editions_index_lists_endpoint():
+    info = client.get("/").json()
+    assert info["compare_editions"] == "POST /api/compare-editions"

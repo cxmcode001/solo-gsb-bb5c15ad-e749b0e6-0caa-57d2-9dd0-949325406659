@@ -34,6 +34,12 @@
 逐位对齐（相同字或任一侧 `?` 记 **0**、已知异字记 **1**，整稿异字数最多 **2**）的方案；唯一方案返回
 插入位置、缺文字串、异字数及接缝两侧 `sources`，不同缺文位置并列返回 **409**，无合格方案返回 **422**；
 结果仅供人工复核，**不改写拼接稿**。
+- **`POST /api/compare-editions`**：提交 `left_segments`、`right_segments` 两组各 **2～5 段**转写，各自
+沿用 `/api/assemble` 的段数、长度限制与续接门槛**分别拼接**，再对两份拼接稿做**全局逐字最小编辑对齐**
+（相同字或任一侧 `?` 代价 **0**，替换/插入/删除各代价 **1**）；同分路径按**对角 → 删除左字 → 插入
+右字**固定择优，`ambiguous` 标记是否存在多条最优路径；把**连续非零代价列**合并为差异块，返回两侧
+左闭右开区间、原文与逐字 `sources`、`total_cost` 及 `ambiguous`；两份稿子完全一致（或仅差 `?`）时
+差异块为空。
 
 ## 快速开始
 
@@ -1020,6 +1026,143 @@ curl -X POST http://localhost:8000/api/audit-omission \
 缺字段，或 segments 不满足 `/api/assemble` 的段数/长度限制、续接失败，同样返回 **422**
 （续接失败时给出 `failed_segment`，从 0 开始）。
 
+### `POST /api/compare-editions`
+
+供校勘人员**对勘两份稿子**。请求含两组各 **2～5 段**转写 `left_segments`、`right_segments`，两组各自
+沿用 `/api/assemble` 的段数/长度限制（单段最长 500 字、**每组各段总长**最长 800 字）与续接门槛，
+**分别独立拼接**为左、右两份稿子（各自的逐字来源相互独立、互不影响），随后对两份拼接稿做
+**全局逐字最小编辑对齐**：
+
+- **两端固定**（不允许自由端）：两份稿子必须从头至尾全部参与对齐；
+- 两字**相同**代价 **0**；**任一侧为 `?`**（未辨认字）的字符对代价也是 **0**；
+- **替换**（双方均为已知字且不同）、**删除左字**、**插入右字**各代价 **1**；
+- **固定择优**：同一动态规划格有多条同代价入边时，回溯所用对齐按 **对角 → 删除左字 → 插入右字**
+  的固定次序选择，故输出确定、可复现；
+- **歧义标记**：`ambiguous` 表示取得最小 `total_cost` 的最优对齐路径是否存在**多条**（不影响返回的
+  那一条固定择优对齐，仅提示校勘人员差异边界可能有别的等价解释）。
+
+**差异块**：把逐字对齐中**连续的非零代价列**合并为一个差异块，零代价列用于分块（相邻的替换、删除、
+插入列会合并在同一块内）。每个 `blocks[]` 给出：
+
+- `left` / `right`：两侧在**各自拼接稿**上的**左闭右开区间** `[start, end)`、区间原文 `fragment`
+  与该区间的逐字 `sources`（规则同 `/api/assemble`）；某一侧在块内无字（纯插入/纯删除）时该侧
+  `start == end`、`fragment` 为空串、`sources` 为空列表。
+
+两份稿子**完全一致**（或仅有 `?` 与已知字的免代价配对）时 `blocks` 为空数组、`total_cost` 为 0、
+`ambiguous` 为 `false`。接口**只做对勘，不改写任何一份拼接稿**。
+
+请求体：
+
+```json
+{
+  "left_segments": ["学而?习之", "时习之不亦"],
+  "right_segments": ["学而?习之", "时习之不", "之不亦乐乎"]
+}
+```
+
+- `left_segments` / `right_segments`：必填，各 **2～5** 个非空字符串；单段最长 500 字，**每一侧**
+  各段总长最长 800 字（两组限制各自独立判定）。
+
+调用示例：
+
+```bash
+curl -X POST http://localhost:8000/api/compare-editions \
+  -H "Content-Type: application/json" \
+  -d '{"left_segments": ["甲乙丙丁戊己", "戊己庚辛"], "right_segments": ["甲乙丙X戊己", "戊己庚辛"]}'
+```
+
+响应示例（左稿 `甲乙丙丁戊己庚辛`、右稿 `甲乙丙X戊己庚辛`，一个替换块，总代价 1，对齐唯一）：
+
+```json
+{
+  "left_text": "甲乙丙丁戊己庚辛",
+  "right_text": "甲乙丙X戊己庚辛",
+  "total_cost": 1,
+  "ambiguous": false,
+  "blocks": [
+    {
+      "left": {
+        "start": 3,
+        "end": 4,
+        "fragment": "丁",
+        "sources": [[{ "segment": 0, "pos": 3 }]]
+      },
+      "right": {
+        "start": 3,
+        "end": 4,
+        "fragment": "X",
+        "sources": [[{ "segment": 0, "pos": 3 }]]
+      }
+    }
+  ]
+}
+```
+
+字段说明：
+
+| 字段 | 含义 |
+| --- | --- |
+| `left_text` / `right_text` | 左 / 右版本的拼接文本（沿用 `/api/assemble`，不被改写） |
+| `total_cost` | 全局逐字最小编辑对齐的总代价（相同字/任一侧 `?` 为 0；替换、插入、删除各 1） |
+| `ambiguous` | 取得该总代价的最优对齐路径是否存在多条 |
+| `blocks[].left` / `blocks[].right` | 差异块在左 / 右拼接稿上的区间 `[start, end)`（左闭右开）、`fragment` 原文与逐字 `sources`；该侧无字时为空区间 |
+
+纯删除/插入块示例——右稿比左稿多一个 `丁`（下标 3），该块 `left` 为空区间：
+
+```bash
+curl -X POST http://localhost:8000/api/compare-editions \
+  -H "Content-Type: application/json" \
+  -d '{"left_segments": ["甲乙丙戊己", "戊己庚辛"], "right_segments": ["甲乙丙丁戊己", "戊己庚辛"]}'
+```
+
+```json
+{
+  "left_text": "甲乙丙戊己庚辛",
+  "right_text": "甲乙丙丁戊己庚辛",
+  "total_cost": 1,
+  "ambiguous": false,
+  "blocks": [
+    {
+      "left": { "start": 3, "end": 3, "fragment": "", "sources": [] },
+      "right": {
+        "start": 3,
+        "end": 4,
+        "fragment": "丁",
+        "sources": [[{ "segment": 0, "pos": 3 }]]
+      }
+    }
+  ]
+}
+```
+
+歧义示例——左稿 `甲乙…`、右稿 `乙甲…`：`甲乙→乙甲` 的替换对齐与删除/插入对齐总代价同为 2，
+存在多条最优路径，`ambiguous` 为 `true`（返回的对齐固定按对角优先，差异块两侧各为 `甲乙`/`乙甲`）：
+
+```bash
+curl -X POST http://localhost:8000/api/compare-editions \
+  -H "Content-Type: application/json" \
+  -d '{"left_segments": ["甲乙戊己", "戊己"], "right_segments": ["乙甲戊己", "戊己"]}'
+```
+
+```json
+{
+  "left_text": "甲乙戊己",
+  "right_text": "乙甲戊己",
+  "total_cost": 2,
+  "ambiguous": true,
+  "blocks": [
+    {
+      "left": { "start": 0, "end": 2, "fragment": "甲乙", "sources": [ "…" ] },
+      "right": { "start": 0, "end": 2, "fragment": "乙甲", "sources": [ "…" ] }
+    }
+  ]
+}
+```
+
+`left_segments` 或 `right_segments` 段数不在 2～5、单段超 500 字、该侧总长超 800 字、含空段或缺字段，
+返回 **422**；某一侧拼接未通过续接门槛时同样返回 **422**，`detail` 中给出 `side`（`left` / `right`）
+与 `failed_segment`（从 0 开始）。
+
 ## 计分与并列规则
 
 - 相同字 **+2**；`?` 与任意字配对 **0**；异字 **-2**；
@@ -1060,6 +1203,12 @@ curl -X POST http://localhost:8000/api/audit-omission \
   拼接稿恰好多 1～40 字。对每条接缝把参照稿同位连续片段补入后逐位对齐（相同字或任一侧 `?` 记 0、
   已知异字记 1，整稿最多 2），取异字数最少的接缝：唯一接缝返回插入位置、缺文、异字数与接缝两侧
   sources，不同缺文位置并列返回 **409**，无接缝或全部超 2 返回 **422**；只提示，不改写拼接稿。
+- `/api/compare-editions` 对 `left_segments`、`right_segments` 两组各 2～5 段转写分别复用
+  `/api/assemble`（各自沿用段数/长度限制与续接失败规则，两侧逐字来源相互独立），再对两份拼接稿做
+  全局逐字最小编辑对齐：两端固定，相同字或任一侧 `?` 代价 0，替换、删除左字、插入右字各 1；同分
+  路径按对角 → 删除左字 → 插入右字固定择优，另以 `ambiguous` 标记最优路径是否多条；连续非零代价列
+  合并为差异块，给出两侧左闭右开区间、原文与逐字 sources，完全一致（或仅差 `?`）时差异块为空；
+  只对勘，不改写任何一份拼接稿。
 
 ## 本地开发（不使用 Docker）
 
@@ -1087,7 +1236,8 @@ app/
   locator.py    # 引文定位：半全局编辑代价 DP 查拼接文本区间；多引文按序不重叠最优链 + 并列/无完整链判定
   repetition.py # 重复抄写发现：对角扫描兼容 run + 滑动窗口取最长/已知相同位最多的非重叠等长区间对
   omission.py   # 脱漏审计：段间接缝枚举 + 参照稿连续缺文补入后逐位异字数（前/后缀和）择优与并列判定
-  main.py       # FastAPI 接口与请求/响应模型（/api/align、/api/assemble、/api/collate、/api/order、/api/revise、/api/locate-quote、/api/locate-quotes、/api/find-repetition、/api/audit-omission）
+  comparator.py # 双版本对勘：两份拼接稿的全局逐字最小编辑 DP（对角/删除/插入择优 + 路径歧义标记）+ 非零列合并差异块
+  main.py       # FastAPI 接口与请求/响应模型（/api/align、/api/assemble、/api/collate、/api/order、/api/revise、/api/locate-quote、/api/locate-quotes、/api/find-repetition、/api/audit-omission、/api/compare-editions）
 tests/          # 算法与接口测试
 Dockerfile      # 镜像构建（含依赖安装）
 docker-compose.yml
